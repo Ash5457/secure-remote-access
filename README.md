@@ -181,6 +181,9 @@ Running the standalone Mullvad app alongside Tailscale broke connectivity (see I
 
 `--exit-node-allow-lan-access` keeps local devices such as printers and the router reachable while the VPN is on.
 
+> [!WARNING]
+> Mullvad exit nodes need UDP. On networks that block it, see Issue 5 for the fallback.
+
 ![Mullvad exit nodes listed in Tailscale](screenshots/14-exit-node-list.png)
 
 ![Public IP before and after enabling the Mullvad exit node](screenshots/15-ip-before-after.png)
@@ -257,18 +260,76 @@ Running the standalone Mullvad app alongside Tailscale broke connectivity (see I
 
 - **Lesson:** Keep *advertising* an exit node (offering one) and *using* an exit node (consuming one) clearly separate in your head.
 
+### Issue 5: Mullvad exit node unusable on public library Wi-Fi (UDP blocked)
+- **Symptom:** On a public library's Wi-Fi, the internet worked with the exit node off, but with the Mullvad exit node on, nothing loaded. RDP to the Windows host over Tailscale still worked.
+- **Ruled out:**
+  - *Re-authenticating Tailscale* (`tailscale down` / `tailscale up`): no change.
+  - *DNS:* tried `tailscale set --accept-dns=false`, with no change. Reverted it afterwards, because it sends DNS lookups to the public network's resolver, which leaks the sites I visit to the network operator.
+- **Diagnosis:** `tailscale netcheck` reported **`UDP: false`**: the library network blocks outbound UDP.
+
+  ![tailscale netcheck reporting UDP blocked](screenshots/17-netcheck-udp-false.png)
+
+- **Root cause:** WireGuard, which both Tailscale and Mullvad use, runs over UDP. When UDP is blocked, Tailscale falls back to its **DERP relay servers over TCP 443 (HTTPS)** for traffic between my own devices. That's why RDP kept working, still end-to-end encrypted with WireGuard; the relay only passes along packets it can't decrypt. The Mullvad exit node, however, didn't work without a direct UDP connection.
+- **Workaround:** made the Windows host a temporary exit node. Its traffic to the laptop rides the same HTTPS relay that RDP uses.
+  1. **Windows** (over RDP, admin PowerShell). A device can't use an exit node and advertise one at the same time, so Mullvad comes off first:
+     ```powershell
+     tailscale set --exit-node= --advertise-exit-node
+     ```
+  2. **Admin console:** Machines → Windows host → **Edit route settings** → tick **Use as exit node**. Without this approval, Fedora reported the host as *not advertising as an exit node*.
+  3. **Fedora:**
+     ```bash
+     tailscale set --exit-node=<WINDOWS_TAILSCALE_IP> --exit-node-allow-lan-access=true
+     tailscale status    # Windows row shows "relay", as expected on a UDP-blocked network
+     ```
+
+  ![Fedora using the Windows host as an exit node over a relay](screenshots/18-home-exit-node-relay.png)
+
+- **Trade-off:**
+
+  | Observer | Mullvad exit node (normal) | Home exit node (this workaround) |
+  |---|---|---|
+  | Public Wi-Fi operator | Encrypted traffic only | Encrypted traffic to Tailscale's relay only |
+  | Home ISP | Encrypted traffic only | Which sites I visit (not page contents) |
+  | Websites | A Mullvad IP | My home IP |
+  | Windows host's own traffic | Through Mullvad | Not through Mullvad while advertising |
+
+  The untrusted network is fully covered. What's lost is the extra privacy from Mullvad: my ISP sees destinations, and websites see my home connection.
+
+- **Options evaluated for keeping Mullvad on UDP-blocked networks:**
+
+  | Option | Outcome |
+  |---|---|
+  | Standalone Mullvad app with obfuscation (disguises WireGuard traffic as TCP) | Gets past UDP blocks, but needs a second subscription and conflicts with Tailscale (see Issue 3) |
+  | Dedicated Linux exit node at home (e.g., an old Chromebook) running Mullvad's WireGuard config plus Tailscale | Works, but needs a standalone Mullvad account and manual routing |
+  | VPN router at home running a Mullvad WireGuard client | Every home device, including the exit node, exits through Mullvad; also needs a standalone account |
+  | Tor Browser through the home exit node | Free, hides browsing from the ISP and websites; browser-only and slow |
+  | **Home exit node as an occasional fallback** | ✅ Chosen for now. UDP-blocked networks are the exception, not the norm |
+
+- **Revert when back on a normal network:**
+  ```powershell
+  # Windows
+  tailscale set --advertise-exit-node=false --exit-node=<mullvad-node> --exit-node-allow-lan-access=true
+  ```
+  ```bash
+  # Fedora
+  tailscale set --exit-node=<mullvad-node> --exit-node-allow-lan-access=true
+  ```
+- **Lesson:** Know what your tools need from the network. WireGuard needs UDP, and restrictive networks block it. Tailscale's relays keep device-to-device access alive, but a third-party exit node won't follow. A fallback plan is part of the design, not an afterthought.
+
+
 ---
 
 ## 6. Final Configuration Summary
 
-| Component | Configuration |
-|---|---|
-| Windows 11 Pro | RDP on, NLA on, Hello-only sign-in off, never sleeps when plugged in |
-| Windows Firewall | RDP allowed only from `100.64.0.0/10` (Tailscale) |
+| Component           | Configuration                                                                               |
+| ------------------- | ------------------------------------------------------------------------------------------- |
+| Windows 11 Pro      | RDP on, NLA on, Hello-only sign-in off, never sleeps when plugged in                        |
+| Windows Firewall    | RDP allowed only from `100.64.0.0/10` (Tailscale)                                           |
 | Tailscale (Windows) | Run unattended, key expiry disabled, Mullvad exit node, LAN access allowed, not advertising |
-| Tailscale (Fedora) | Official repo, user set as operator, Mullvad exit node, LAN access allowed |
-| RDP client | FreeRDP (`xfreerdp`) with TOFU certificate pinning; Remmina profile as a GUI alternative |
-| VPN | Mullvad via Tailscale add-on; standalone Mullvad app retired |
+| Tailscale (Fedora)  | Official repo, user set as operator, Mullvad exit node, LAN access allowed                  |
+| RDP client          | FreeRDP (`xfreerdp`) with TOFU certificate pinning; Remmina profile as a GUI alternative    |
+| VPN                 | Mullvad via Tailscale add-on; standalone Mullvad app retired                                |
+| Fallback            | Windows host as exit node on UDP-blocked networks (see Issue 5)                             |
 
 ---
 
@@ -291,16 +352,18 @@ Running the standalone Mullvad app alongside Tailscale broke connectivity (see I
 - **Know your threat model.** A home exit node protects against public Wi-Fi but not against my ISP. Only a third-party exit point (Mullvad) does both.
 - **Avoid fragile setups on remote machines.** If a configuration can break on reboot, it will break while you're away.
 - **Overlay networks ≠ VPN providers.** Tailscale connects my devices to each other; Mullvad hides my traffic from the outside world. They solve different problems.
+- **WireGuard needs UDP.** Restrictive networks block it. Tailscale's relays keep my own devices connected, but third-party exit nodes don't follow.
 
 ---
 
 ## 9. Future Improvements
 
 - [ ] Set laptop lid-close action to *Do nothing* when plugged in, so the Windows laptop stays reachable
-- [ ] Add Tailscale to my Android phone with a Mullvad exit node, plus Android's *Always-on VPN* and *Block connections without VPN*
+- [x] Add Tailscale to my Android phone with a Mullvad exit node, plus Android's *Always-on VPN* and *Block connections without VPN*
 - [ ] Write Tailscale ACLs so only my Fedora machine can reach the Windows machine on 3389
 - [ ] Explore MFA for remote access (e.g., Tailscale SSH or a device-posture check)
 - [ ] Set up an old Chromebook as a Linux file server (NAS) on the tailnet
+- [ ] Dedicated Mullvad exit node at home (Linux box or VPN router) so Mullvad works even on UDP-blocked networks
 
 ---
 
