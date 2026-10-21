@@ -303,7 +303,60 @@ Running the standalone Mullvad app alongside Tailscale broke connectivity (see I
   | Dedicated Linux exit node at home (e.g., an old Chromebook) running Mullvad's WireGuard config plus Tailscale | Works, but needs a standalone Mullvad account and manual routing |
   | VPN router at home running a Mullvad WireGuard client | Every home device, including the exit node, exits through Mullvad; also needs a standalone account |
   | Tor Browser through the home exit node | Free, hides browsing from the ISP and websites; browser-only and slow |
-  | **Home exit node as an occasional fallback** | ✅ Chosen for now. UDP-blocked networks are the exception, not the norm |
+  | Home exit node | Works, but my ISP sees destinations and websites see my home IP |
+  | **SOCKS proxy through the Windows host** (below) | Chosen. Keeps Mullvad for Firefox with no second subscription |
+
+#### Better workaround: browse through the home host and keep Mullvad
+
+- **Discovery:** with Fedora's Mullvad exit node left **on**, RDP to the Windows host still worked. Tailscale fails closed: Fedora's internet traffic had nowhere to go, but traffic between my own devices still used the HTTPS relay. Meanwhile the Windows host, sitting at home where UDP isn't blocked, was on its own Mullvad exit node. So anything I did *inside the RDP session* went library → relay → home → Mullvad. That's full Mullvad protection with zero setup, at the cost of browsing inside a remote desktop.
+- **Goal:** get the same path for Fedora's own browser, without a second VPN subscription.
+- **Approach:** an SSH tunnel to the Windows host with a SOCKS proxy (`ssh -D`). Firefox sends its traffic into the tunnel over the tailnet, and it comes out at the Windows host, which sends it through Mullvad. Tailscale's relay does the "wrap it in HTTPS" part that Mullvad's app calls obfuscation.
+
+```mermaid
+flowchart LR
+    FF["Firefox on Fedora"] -- "SSH tunnel over Tailscale relay (TCP 443)" --> W["Windows host (home)"]
+    W -- "WireGuard over UDP" --> M[("Mullvad exit node")]
+    M --> I(("Internet"))
+```
+
+- **Setup on Windows** (admin PowerShell):
+  ```powershell
+  Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+  Start-Service sshd
+  Set-Service sshd -StartupType Automatic
+  Set-NetFirewallRule -Name OpenSSH-Server-In-TCP -RemoteAddress 100.64.0.0/10   # SSH from Tailscale only, same as RDP
+  ```
+- **Setup on Fedora:**
+  ```bash
+  ssh -D 1080 -N <windows-username>@<WINDOWS_TAILSCALE_IP>   # local SOCKS proxy on port 1080, exits at Windows
+  ```
+  Firefox → Settings → Network Settings → **Manual proxy configuration** → SOCKS Host `127.0.0.1`, Port `1080`, **SOCKS v5**, and tick **Proxy DNS when using SOCKS v5**. Without that last box, DNS lookups would go to the library's resolver.
+
+  ![SSH tunnel with a SOCKS proxy to the Windows host](screenshots/19-ssh-socks-tunnel.png)
+
+- **Problems along the way:**
+  - *`Add-WindowsCapability` ran for minutes, then errored.* `Get-WindowsCapability` afterwards showed OpenSSH Server as **Staged** rather than Installed, but `Start-Service sshd` succeeded, so the service was usable.
+  - *`Permission denied, please try again` from Fedora.* That message comes from the SSH server itself, so the network path and firewall were fine and the failure was authentication. The same lesson as Issue 2: logging in with the **local profile username** plus the Microsoft account password worked.
+- **Verification:** mullvad.net/check in Firefox on Fedora reports **Using Mullvad VPN** with no DNS leaks, while on the UDP-blocked library network.
+
+  ![mullvad.net/check passing in Firefox on Fedora through the SOCKS proxy](screenshots/20-firefox-socks-mullvad-check.png)
+
+- **How the options compare on a UDP-blocked network:**
+
+  | Observer | Home exit node | Browsing inside RDP | SOCKS proxy through Windows |
+  |---|---|---|---|
+  | Public Wi-Fi operator | Encrypted relay traffic only | Encrypted relay traffic only | Encrypted relay traffic only |
+  | Home ISP | Which sites I visit | Encrypted Mullvad traffic only | Encrypted Mullvad traffic only |
+  | Websites | My home IP | A Mullvad IP | A Mullvad IP |
+  | Setup | Change settings on both machines | None | One-time OpenSSH install |
+
+- **Limits:**
+  - Only apps pointed at the proxy get internet (Firefox, not system updates). Everything else stays blocked by Tailscale's fail-closed behaviour, which is what I want on an untrusted network.
+  - Slower than a direct VPN: an extra hop, and web traffic inside WireGuard inside TCP is TCP-in-TCP, which degrades under packet loss. In practice it was fine for browsing.
+  - The Windows host has to be awake.
+  - SSH uses password authentication for now. It's only reachable from the tailnet thanks to the firewall rule, but key-based auth is the stronger option and is on the improvements list.
+- **Why not a UDP-over-TCP tool?** Tools like `mullvad/udp-over-tcp` need a component at both ends. Tailscale's relay already provides WireGuard-over-TCP to my own devices, so the only missing piece was routing the browser through the home host.
+- **Lesson:** Look at what already works before adding tools. The UDP-over-TCP path to my house already existed in Tailscale's relay; chaining it to Mullvad at the application layer gave me the obfuscation effect without another subscription.
 
 - **Revert when back on a normal network:**
   ```powershell
@@ -321,15 +374,15 @@ Running the standalone Mullvad app alongside Tailscale broke connectivity (see I
 
 ## 6. Final Configuration Summary
 
-| Component           | Configuration                                                                               |
-| ------------------- | ------------------------------------------------------------------------------------------- |
-| Windows 11 Pro      | RDP on, NLA on, Hello-only sign-in off, never sleeps when plugged in                        |
-| Windows Firewall    | RDP allowed only from `100.64.0.0/10` (Tailscale)                                           |
-| Tailscale (Windows) | Run unattended, key expiry disabled, Mullvad exit node, LAN access allowed, not advertising |
-| Tailscale (Fedora)  | Official repo, user set as operator, Mullvad exit node, LAN access allowed                  |
-| RDP client          | FreeRDP (`xfreerdp`) with TOFU certificate pinning; Remmina profile as a GUI alternative    |
-| VPN                 | Mullvad via Tailscale add-on; standalone Mullvad app retired                                |
-| Fallback            | Windows host as exit node on UDP-blocked networks (see Issue 5)                             |
+| Component           | Configuration                                                                                 |
+| ------------------- | --------------------------------------------------------------------------------------------- |
+| Windows 11 Pro      | RDP on, NLA on, Hello-only sign-in off, never sleeps when plugged in                          |
+| Windows Firewall    | RDP allowed only from `100.64.0.0/10` (Tailscale)                                             |
+| Tailscale (Windows) | Run unattended, key expiry disabled, Mullvad exit node, LAN access allowed, not advertising   |
+| Tailscale (Fedora)  | Official repo, user set as operator, Mullvad exit node, LAN access allowed                    |
+| RDP client          | FreeRDP (`xfreerdp`) with TOFU certificate pinning; Remmina profile as a GUI alternative      |
+| VPN                 | Mullvad via Tailscale add-on; standalone Mullvad app retired                                  |
+| Fallback            | On UDP-blocked networks: Firefox through an SSH SOCKS proxy to the Windows host (see Issue 5) |
 
 ---
 
@@ -364,6 +417,7 @@ Running the standalone Mullvad app alongside Tailscale broke connectivity (see I
 - [ ] Explore MFA for remote access (e.g., Tailscale SSH or a device-posture check)
 - [ ] Set up an old Chromebook as a Linux file server (NAS) on the tailnet
 - [ ] Dedicated Mullvad exit node at home (Linux box or VPN router) so Mullvad works even on UDP-blocked networks
+- [ ] Switch the SSH tunnel from password to key-based authentication
 
 ---
 
